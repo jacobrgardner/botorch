@@ -42,18 +42,18 @@ from botorch.optim.utils import (
     create_name_filter,
 )
 from gpytorch import settings as gpt_settings
+from gpytorch.mlls._approximate_mll import _ApproximateMarginalLogLikelihood
 from gpytorch.mlls.marginal_log_likelihood import MarginalLogLikelihood
 from scipy.optimize import Bounds, minimize
 from torch import Tensor
 from torch.nn import Module
 from torch.optim.adam import Adam
 from torch.optim.optimizer import Optimizer
+from torch.utils.data import Dataset, DataLoader
 
 
 ParameterBounds = Dict[str, Tuple[Optional[float], Optional[float]]]
-TScipyObjective = Callable[
-    [np.ndarray, MarginalLogLikelihood, Dict[str, TorchAttr]], Tuple[float, np.ndarray]
-]
+TScipyObjective = Callable[[np.ndarray, MarginalLogLikelihood, Dict[str, TorchAttr]], Tuple[float, np.ndarray]]
 TModToArray = Callable[
     [Module, Optional[ParameterBounds], Optional[Set[str]]],
     Tuple[np.ndarray, Dict[str, TorchAttr], Optional[np.ndarray]],
@@ -169,9 +169,7 @@ def fit_gpytorch_scipy(
         except AttributeError:
             # Others are str
             msg = res.message
-        warnings.warn(
-            f"Fitting failed with the optimizer reporting '{msg}'", OptimizationWarning
-        )
+        warnings.warn(f"Fitting failed with the optimizer reporting '{msg}'", OptimizationWarning)
     # Set to optimum
     mll = module_from_array_func(mll, res.x, property_dict)
     return mll, info_dict
@@ -230,9 +228,7 @@ def fit_gpytorch_torch(
     if exclude is None:
         mll_params = list(mll.parameters())
     else:
-        mll_params = [
-            v for k, v in filter(create_name_filter(exclude), mll.named_parameters())
-        ]
+        mll_params = [v for k, v in filter(create_name_filter(exclude), mll.named_parameters())]
 
     optimizer = optimizer_cls(
         params=[{"params": mll_params}],
@@ -253,15 +249,11 @@ def fit_gpytorch_torch(
     iterations = []
     t1 = monotonic()
 
-    param_trajectory: Dict[str, List[Tensor]] = {
-        name: [] for name, param in mll.named_parameters()
-    }
+    param_trajectory: Dict[str, List[Tensor]] = {name: [] for name, param in mll.named_parameters()}
     loss_trajectory: List[float] = []
     i = 0
     stop = False
-    stopping_criterion = ExpMAStoppingCriterion(
-        **_filter_kwargs(ExpMAStoppingCriterion, **optim_options)
-    )
+    stopping_criterion = ExpMAStoppingCriterion(**_filter_kwargs(ExpMAStoppingCriterion, **optim_options))
     train_inputs, train_targets = mll.model.train_inputs, mll.model.train_targets
     while not stop:
         optimizer.zero_grad()
@@ -274,9 +266,7 @@ def fit_gpytorch_torch(
         loss_trajectory.append(loss.item())
         for name, param in mll.named_parameters():
             param_trajectory[name].append(param.detach().clone())
-        if optim_options["disp"] and (
-            (i + 1) % 10 == 0 or i == (optim_options["maxiter"] - 1)
-        ):
+        if optim_options["disp"] and ((i + 1) % 10 == 0 or i == (optim_options["maxiter"] - 1)):
             print(f"Iter {i + 1}/{optim_options['maxiter']}: {loss.item()}")
         if track_iterations:
             iterations.append(OptimizationIteration(i, loss.item(), monotonic() - t1))
@@ -289,6 +279,129 @@ def fit_gpytorch_torch(
                     param.data = param.data.clamp(*bounds_[pname])
         i += 1
         stop = stopping_criterion.evaluate(fvals=loss.detach())
+    info_dict = {
+        "fopt": loss_trajectory[-1],
+        "wall_time": monotonic() - t1,
+        "iterations": iterations,
+    }
+    return mll, info_dict
+
+
+def fit_gpytorch_torch_stochastic(
+    mll: _ApproximateMarginalLogLikelihood,
+    minibatch_size: int = 128,
+    num_epochs: int = 100,
+    bounds: Optional[ParameterBounds] = None,
+    optimizer_cls: Optimizer = Adam,
+    options: Optional[Dict[str, Any]] = None,
+    track_iterations: bool = False,
+) -> Tuple[_ApproximateMarginalLogLikelihood, Dict[str, Union[float, List[OptimizationIteration]]]]:
+    r"""Fit an approximate gpytorch model by maximizing an approximate MLL stochastically with a torch optimizer.
+
+    The model and likelihood in mll must already be in train mode.
+    Note: this method requires that the model has `train_inputs` and `train_targets`.
+
+    Args:
+        mll: ApproximateMarginalLogLikelihood to be maximized.
+        bounds: A ParameterBounds dictionary mapping parameter names to tuples
+            of lower and upper bounds. Bounds specified here take precedence
+            over bounds on the same parameters specified in the constraints
+            registered with the module.
+        optimizer_cls: Torch optimizer to use. Must not require a closure.
+        options: options for model fitting. Relevant options will be passed to
+            the `optimizer_cls`. Additionally, options can include: "disp"
+            to specify whether to display model fitting diagnostics and "maxiter"
+            to specify the maximum number of iterations.
+        track_iterations: Track the function values and wall time for each
+            iteration.
+
+    Returns:
+        2-element tuple containing
+        - mll with parameters optimized in-place.
+        - Dictionary with the following key/values:
+        "fopt": Best mll value.
+        "wall_time": Wall time of fitting.
+        "iterations": List of OptimizationIteration objects with information on each
+        iteration. If track_iterations is False, will be empty.
+    """
+    optim_options = {"disp": True, "lr": 0.01}
+    optim_options.update(options or {})
+    exclude = optim_options.pop("exclude", None)
+    if exclude is None:
+        mll_params = list(mll.parameters())
+    else:
+        mll_params = [v for k, v in filter(create_name_filter(exclude), mll.named_parameters())]
+
+    optimizer = optimizer_cls(
+        params=[{"params": mll_params}],
+        **_filter_kwargs(optimizer_cls, **optim_options),
+    )
+
+    # get bounds specified in model (if any)
+    bounds_: ParameterBounds = {}
+    if hasattr(mll, "named_parameters_and_constraints"):
+        for param_name, _, constraint in mll.named_parameters_and_constraints():
+            if constraint is not None and not constraint.enforced:
+                bounds_[param_name] = constraint.lower_bound, constraint.upper_bound
+
+    # update with user-supplied bounds (overwrites if already exists)
+    if bounds is not None:
+        bounds_.update(bounds)
+
+    iterations = []
+    t1 = monotonic()
+
+    param_trajectory: Dict[str, List[Tensor]] = {name: [] for name, param in mll.named_parameters()}
+    loss_trajectory: List[float] = []
+    i = 0
+    stop = False
+    stopping_criterion = ExpMAStoppingCriterion(**_filter_kwargs(ExpMAStoppingCriterion, **optim_options))
+    train_inputs, train_targets = mll.model.train_inputs, mll.model.train_targets
+
+    class GPyTorchDataset(Dataset):
+        """
+        A PyTorch Dataset wrapping train_inputs as a list and train_targets.
+
+        TODO: Where should this live?
+        """
+
+        def __init__(self, inputs: Tensor, targets: Tensor) -> None:
+            self.inputs = inputs
+            self.targets = targets
+
+        def __getitem__(self, index: int) -> Tuple[List[Tensor], Tensor]:
+            return [_input[index] for _input in self.inputs], self.targets[index]
+
+        def __len__(self) -> int:
+            return self.targets.size(-1)
+
+    dataset = GPyTorchDataset(train_inputs, train_targets)
+    dataloader = DataLoader(dataset, batch_size=minibatch_size, shuffle=True)  # TODO: Expose shuffle as an option?
+
+    for epoch in range(num_epochs):
+        for batch_idx, (inputs, targets) in enumerate(dataloader):
+            optimizer.zero_grad()
+            output = mll.model(*inputs)
+
+            # we sum here to support batch mode
+            loss = -mll(output, targets).sum()
+            loss.backward()
+            optimizer.step()
+
+            # project onto bounds:
+            if bounds_:
+                for pname, param in mll.named_parameters():
+                    if pname in bounds_:
+                        param.data = param.data.clamp(*bounds_[pname])
+
+            loss_trajectory.append(loss.item())
+            for name, param in mll.named_parameters():
+                param_trajectory[name].append(param.detach().clone())
+            if track_iterations:
+                iterations.append(OptimizationIteration(i, loss.item(), monotonic() - t1))
+            i += 1
+        optimizer.zero_grad()
+
     info_dict = {
         "fopt": loss_trajectory[-1],
         "wall_time": monotonic() - t1,

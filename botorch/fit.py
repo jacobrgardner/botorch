@@ -16,13 +16,13 @@ from warnings import catch_warnings, simplefilter, warn, WarningMessage
 
 from botorch.exceptions.errors import ModelFittingError, UnsupportedError
 from botorch.exceptions.warnings import BotorchWarning, OptimizationWarning
+from botorch.models.approximate_gp import ApproximateGPyTorchModel
 from botorch.models.converter import batched_to_model_list, model_list_to_batched
 from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
 from botorch.models.fully_bayesian_multitask import SaasFullyBayesianMultiTaskGP
-
 from botorch.models.gpytorch import BatchedMultiOutputGPyTorchModel
 from botorch.models.model_list_gp_regression import ModelListGP
-from botorch.optim.fit import fit_gpytorch_scipy
+from botorch.optim.fit import fit_gpytorch_scipy, fit_gpytorch_torch_stochastic
 from botorch.optim.utils import (
     allclose_mll,
     del_attribute_ctx,
@@ -36,7 +36,9 @@ from botorch.settings import debug
 from botorch.utils.dispatcher import Dispatcher, MDNotImplementedError
 from gpytorch.likelihoods import Likelihood
 from gpytorch.mlls.marginal_log_likelihood import MarginalLogLikelihood
+from gpytorch.mlls._approximate_mll import _ApproximateMarginalLogLikelihood
 from gpytorch.mlls.sum_marginal_log_likelihood import SumMarginalLogLikelihood
+from gpytorch.models import ApproximateGP
 from linear_operator.utils.errors import NotPSDError
 from pyro.infer.mcmc import MCMC, NUTS
 from torch import device, mean, Tensor
@@ -143,8 +145,7 @@ def fit_gpytorch_model(
             this keyword argument is omitted when calling `fit_gpytorch_mll`.
     """
     warn(
-        "`fit_gpytorch_model` is marked for deprecation, consider using "
-        "`fit_gpytorch_mll` instead.",
+        "`fit_gpytorch_model` is marked for deprecation, consider using " "`fit_gpytorch_mll` instead.",
         DeprecationWarning,
     )
     if max_retries is not None:
@@ -161,11 +162,7 @@ def fit_gpytorch_model(
 
         optimizer_kwargs[key] = val
 
-    with (
-        nullcontext()
-        if exclude is None
-        else requires_grad_ctx(mll, assignments={name: False for name in exclude})
-    ):
+    with (nullcontext() if exclude is None else requires_grad_ctx(mll, assignments={name: False for name in exclude})):
         try:
             mll = fit_gpytorch_mll(
                 mll,
@@ -260,8 +257,7 @@ def _fit_fallback(
             except caught_exception_types as err:
                 logging.log(
                     logging.DEBUG,
-                    f"Fit attempt #{attempt} of {max_attempts} failed with exception: "
-                    f"{err}",
+                    f"Fit attempt #{attempt} of {max_attempts} failed with exception: " f"{err}",
                 )
 
     raise ModelFittingError("All attempts to fit the model have failed.")
@@ -313,9 +309,7 @@ def _fit_multioutput_independent(
         i.e. `mll.training == False`. Otherwise, `mll` will be in training mode.
     """
     if (  # incompatible models
-        not sequential
-        or mll.model.num_outputs == 1
-        or mll.likelihood is not getattr(mll.model, "likelihood", None)
+        not sequential or mll.model.num_outputs == 1 or mll.likelihood is not getattr(mll.model, "likelihood", None)
     ):
         raise MDNotImplementedError  # defer to generic
 
@@ -344,8 +338,7 @@ def _fit_multioutput_independent(
                 mll.load_state_dict(repacked_mll.state_dict())
                 if not allclose_mll(a=mll, b=repacked_mll):
                     raise RuntimeError(  # validate model repacking
-                        "Training loss of repacked model differs from that of the "
-                        "original."
+                        "Training loss of repacked model differs from that of the " "original."
                     )
                 ckpt.clear()  # do not rollback when exiting
                 return mll.eval()  # DONE!
@@ -403,12 +396,56 @@ def fit_fully_bayesian_model_nuts(
     mcmc.run()
 
     # Get final MCMC samples from the Pyro model
-    mcmc_samples = model.pyro_model.postprocess_mcmc_samples(
-        mcmc_samples=mcmc.get_samples()
-    )
+    mcmc_samples = model.pyro_model.postprocess_mcmc_samples(mcmc_samples=mcmc.get_samples())
     for k, v in mcmc_samples.items():
         mcmc_samples[k] = v[::thinning]
 
     # Load the MCMC samples back into the BoTorch model
     model.load_mcmc_samples(mcmc_samples)
     model.eval()
+
+
+@dispatcher.register(_ApproximateMarginalLogLikelihood, Likelihood, ApproximateGP)
+def _fit_approximategp_stochastic(
+    mll: _ApproximateMarginalLogLikelihood,
+    _: Type[Likelihood],
+    __: Type[ApproximateGPyTorchModel],
+    minibatch_size: int = 128,
+    num_epochs: int = 100,
+    optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    max_attempts: int = 5,
+    warning_filter: Callable[[WarningMessage], bool] = DEFAULT_WARNING_FILTER,
+    caught_exception_types: Tuple[Type[BaseException], ...] = (NotPSDError,),
+) -> _ApproximateMarginalLogLikelihood:
+    optimizer_kwargs = optimizer_kwargs or {}
+    mll.train()
+    for attempt in range(1, 1 + max_attempts):
+        try:
+            with catch_warnings(record=True) as warning_list, debug(True):
+                simplefilter("always", category=OptimizationWarning)
+                mll, _ = fit_gpytorch_torch_stochastic(
+                    mll, num_epochs=num_epochs, minibatch_size=minibatch_size, **optimizer_kwargs
+                )
+
+            done = True
+            for unresolved_warning in filter(warning_filter, warning_list):
+                warn(unresolved_warning.message, unresolved_warning.category)
+                done = False
+
+            if done:
+                return mll.eval()
+
+            mll = mll if mll.training else mll.train()
+            logging.log(
+                logging.DEBUG,
+                f"Fit attempt #{attempt} of {max_attempts} triggered retry policy"
+                f"{'.' if attempt == max_attempts else '; retrying...'}",
+            )
+
+        except caught_exception_types as err:
+            logging.log(
+                logging.DEBUG,
+                f"Fit attempt #{attempt} of {max_attempts} failed with exception: " f"{err}",
+            )
+
+    return ModelFittingError("All attempts to fit the model have failed.")
